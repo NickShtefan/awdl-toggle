@@ -33,11 +33,14 @@ Your numbers will depend on the Mac, the Wi-Fi and how many Apple devices are ar
 - **Turn AWDL off / on**: manual switch.
 - **Auto: off while playing GeForce NOW** (off by default): when a game stream starts, AWDL goes
   off. macOS sometimes brings it back up on its own; the app hears about that from the kernel at
-  once and turns it off again, with a check every 3 seconds as a backup. When the stream ends, or
-  the client quits or crashes, AWDL goes back on. Just opening the GeForce NOW client changes
-  nothing; only an actual game does.
-- Turning AWDL on by hand during a game keeps it on until that game ends.
-- Every change is written to `~/Library/Logs/AWDLToggle.log`.
+  once and turns it off again, with a check every 3 seconds as a backup. If macOS keeps raising it
+  right back, the app turns it off at most every 0.5 seconds, and at most every 3 seconds after
+  10 times in 10 seconds. When the stream ends, or the client quits or crashes, AWDL goes back on.
+  Just opening the GeForce NOW client changes nothing; only an actual game does.
+- Turning AWDL on by hand during a game keeps it on until that game ends. So does a switch that
+  fails or whose password dialog you cancel, so you are not asked again and again.
+- Every change is written to `~/Library/Logs/AWDLToggle.log`; past 1 MB it moves to
+  `AWDLToggle.log.1`.
 
 While AWDL is off, AirDrop, Sidecar, Universal Control and peer-to-peer AirPlay do not work.
 Normal Wi-Fi is not affected.
@@ -89,14 +92,17 @@ sees:
 ~/Applications/"AWDL Toggle.app"/Contents/MacOS/AWDLToggle --stream-state
 ```
 
-It prints `streaming` or `idle`; `--status` prints whether AWDL is `up` or `down`, and `--watch`
-prints `up` or `down` every time `awdl0` changes, until you press Ctrl+C.
+It prints `streaming` or `idle`. `--status` prints whether AWDL is `up` or `down`, and `--watch`
+prints the state of `awdl0` each time the kernel reports a change to it, until you press Ctrl+C.
+To see it react, run `sudo ifconfig awdl0 down` and then `up` in another window.
 
 ## How AWDL is kept down
 
-Changes to `awdl0` arrive on the kernel's routing socket (`PF_ROUTE`), which any user can read,
-so the app learns about them without root and without polling. Bringing the interface down still
-needs root, which goes through `sudo` and the rule above.
+The kernel reports changes to `awdl0` on its routing socket (`PF_ROUTE`), which any user can
+read, so the app learns about them as they happen and without root. Any local user can also
+write a fake message there, so a message only makes the app read the real interface flags; it
+never acts on what the message says. The check every 3 seconds stays as a backup. Bringing the
+interface down needs root, which goes through `sudo` and the rule above.
 
 ## Tests
 
@@ -118,8 +124,8 @@ and `sudo ifconfig awdl0 up` to bring it back. A reboot also brings it back.
 
 ## Similar projects
 
-- [awdlkiller](https://github.com/jamestut/awdlkiller): keeps AWDL down at all times; the
-  routing-socket approach used here comes from it.
+- [awdlkiller](https://github.com/jamestut/awdlkiller): a root daemon that keeps AWDL down while
+  you have it switched off (`awdl off`); the routing-socket approach used here comes from it.
 - [Stop Stutter](https://github.com/burakgon/stop-stutter): signed app with a privileged helper;
   holds AWDL off while a chosen client (GeForce NOW, Moonlight, Parsec, Steam Link and others)
   is open.
@@ -130,8 +136,9 @@ and `sudo ifconfig awdl0 up` to bring it back. A reboot also brings it back.
 - [geforcenow-awdl0](https://github.com/sjparkinson/geforcenow-awdl0): holds AWDL off while
   GeForce NOW has a fullscreen window.
 
-AWDL Toggle differs in reacting to the game stream itself rather than to the client being open
-or in front, so AirDrop keeps working while you browse the GeForce NOW library.
+AWDL Toggle differs in following the game stream itself, from the GeForce NOW client's log,
+rather than the client being open, a game being in front or a window going fullscreen, so
+AirDrop keeps working while you browse the GeForce NOW library.
 
 The AWDL Control README also suggests putting the access point's 5 GHz band on channel 44 (EU) or
 149 (US), the channels AWDL tends to use, so the radio has less reason to leave. That has not
