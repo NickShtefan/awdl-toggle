@@ -49,7 +49,8 @@ func awdlIsUp() -> Bool {
 func setAwdl(up: Bool) -> Bool {
     let action = up ? "up" : "down"
     if let dir = testDir {
-        return (try? action.write(toFile: dir + "/awdl", atomically: true, encoding: .utf8)) != nil
+        // In place, so the watcher's file descriptor keeps pointing at the same file.
+        return (try? action.write(toFile: dir + "/awdl", atomically: false, encoding: .utf8)) != nil
     }
     if run("/usr/bin/sudo", ["-n", ifconfigPath, "awdl0", action]).code == 0 { return true }
     let script = "do shell script \"\(ifconfigPath) awdl0 \(action)\" with administrator privileges"
@@ -77,6 +78,41 @@ func logSaysStreaming() -> Bool {
     return false
 }
 
+// Reports awdl0 going up or down as it happens: from the kernel's routing socket, which any
+// user can read, or in test mode from writes to the simulated interface file.
+final class AwdlWatcher {
+    private var source: DispatchSourceProtocol?
+    var isActive: Bool { source != nil }
+
+    init(onChange: @escaping (Bool) -> Void) {
+        if let dir = testDir {
+            let fd = open(dir + "/awdl", O_EVTONLY)
+            guard fd >= 0 else { return }
+            let s = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
+            s.setEventHandler { onChange(awdlIsUp()) }
+            s.setCancelHandler { close(fd) }
+            s.resume()
+            source = s
+            return
+        }
+        let fd = socket(PF_ROUTE, SOCK_RAW, 0)
+        guard fd >= 0 else { return }
+        let s = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        s.setEventHandler {
+            var buffer = [UInt8](repeating: 0, count: 2048)
+            let n = read(fd, &buffer, buffer.count)
+            guard n >= MemoryLayout<if_msghdr>.size else { return }
+            let msg = buffer.withUnsafeBytes { $0.loadUnaligned(as: if_msghdr.self) }
+            // Looked up per message, since the interface index can change if awdl0 is recreated.
+            guard Int32(msg.ifm_type) == RTM_IFINFO, UInt32(msg.ifm_index) == if_nametoindex("awdl0") else { return }
+            onChange(msg.ifm_flags & IFF_UP != 0)
+        }
+        s.setCancelHandler { close(fd) }
+        s.resume()
+        source = s
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var busy = false
@@ -84,15 +120,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Set after a manual "on" or a cancelled dialog, cleared when the stream ends.
     var keepOn = false
     var rendered: (up: Bool, streaming: Bool, auto: Bool)?
+    var watcher: AwdlWatcher?
 
     var autoEnabled: Bool {
         get { testDir != nil || UserDefaults.standard.bool(forKey: autoKey) }
         set { UserDefaults.standard.set(newValue, forKey: autoKey) }
     }
 
-    func applicationDidFinishLaunching(_ note: Notification) {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        watcher = AwdlWatcher { [weak self] up in self?.awdlChanged(up: up) }
+        if watcher?.isActive != true { note("interface watcher unavailable, relying on the 3 s check") }
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
         tick()
+    }
+
+    // macOS can raise awdl0 mid-stream at any moment; reacting to the event instead of waiting
+    // for the next tick keeps it from staying up for up to 3 seconds.
+    func awdlChanged(up: Bool) {
+        // apply() checks the state again when it finishes, so nothing is lost here.
+        guard !busy else { return }
+        render(up: up, streaming: wasStreaming)
+        if wasStreaming && up && !keepOn {
+            note("awdl came up during stream, turning off")
+            apply(up: false)
+        }
     }
 
     func tick() {
@@ -117,11 +168,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // macOS can raise awdl0 on its own, so this keeps checking during the stream.
         if streaming && up && !keepOn {
             note("awdl is up during stream, turning off")
-            apply(up: false, auto: true)
+            apply(up: false)
         }
     }
 
-    func apply(up: Bool, auto: Bool = false) {
+    func apply(up: Bool) {
         guard !busy else { return }
         busy = true
         DispatchQueue.global().async {
@@ -129,8 +180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             note("set \(up ? "up" : "down"): \(ok ? "ok" : "failed")")
             DispatchQueue.main.async {
                 self.busy = false
-                if auto && !ok { self.keepOn = true }
-                self.render(up: awdlIsUp(), streaming: self.wasStreaming)
+                // A failed or cancelled switch would otherwise be retried at once with another
+                // password dialog, so AWDL stays as it is until the stream ends.
+                if !ok { self.keepOn = true }
+                self.awdlChanged(up: awdlIsUp())
             }
         }
     }
@@ -190,6 +243,16 @@ if CommandLine.arguments.contains("--status") {
 if CommandLine.arguments.contains("--stream-state") {
     print(logSaysStreaming() ? "streaming" : "idle")
     exit(0)
+}
+if CommandLine.arguments.contains("--watch") {
+    let watcher = AwdlWatcher { up in print(up ? "up" : "down"); fflush(stdout) }
+    guard watcher.isActive else {
+        print("cannot watch awdl0")
+        exit(1)
+    }
+    print(awdlIsUp() ? "up" : "down")
+    fflush(stdout)
+    withExtendedLifetime(watcher) { dispatchMain() }
 }
 
 let app = NSApplication.shared

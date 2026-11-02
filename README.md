@@ -32,9 +32,10 @@ Your numbers will depend on the Mac, the Wi-Fi and how many Apple devices are ar
 - Menu bar icon: radio waves while AWDL is on, a game controller while it is off.
 - **Turn AWDL off / on**: manual switch.
 - **Auto: off while playing GeForce NOW** (off by default): when a game stream starts, AWDL goes
-  off. macOS sometimes brings it back up on its own, so during the stream the app checks every
-  3 seconds and turns it off again. When the stream ends, or the client quits or crashes, AWDL
-  goes back on. Just opening the GeForce NOW client changes nothing; only an actual game does.
+  off. macOS sometimes brings it back up on its own; the app hears about that from the kernel at
+  once and turns it off again, with a check every 3 seconds as a backup. When the stream ends, or
+  the client quits or crashes, AWDL goes back on. Just opening the GeForce NOW client changes
+  nothing; only an actual game does.
 - Turning AWDL on by hand during a game keeps it on until that game ends.
 - Every change is written to `~/Library/Logs/AWDLToggle.log`.
 
@@ -88,7 +89,14 @@ sees:
 ~/Applications/"AWDL Toggle.app"/Contents/MacOS/AWDLToggle --stream-state
 ```
 
-It prints `streaming` or `idle`; `--status` prints whether AWDL is `up` or `down`.
+It prints `streaming` or `idle`; `--status` prints whether AWDL is `up` or `down`, and `--watch`
+prints `up` or `down` every time `awdl0` changes, until you press Ctrl+C.
+
+## How AWDL is kept down
+
+Changes to `awdl0` arrive on the kernel's routing socket (`PF_ROUTE`), which any user can read,
+so the app learns about them without root and without polling. Bringing the interface down still
+needs root, which goes through `sudo` and the rule above.
 
 ## Tests
 
@@ -107,6 +115,27 @@ sudo ifconfig awdl0 down
 ```
 
 and `sudo ifconfig awdl0 up` to bring it back. A reboot also brings it back.
+
+## Similar projects
+
+- [awdlkiller](https://github.com/jamestut/awdlkiller): keeps AWDL down at all times; the
+  routing-socket approach used here comes from it.
+- [Stop Stutter](https://github.com/burakgon/stop-stutter): signed app with a privileged helper;
+  holds AWDL off while a chosen client (GeForce NOW, Moonlight, Parsec, Steam Link and others)
+  is open.
+- [AWDL Control](https://github.com/james-howard/AWDLControl): holds AWDL off while the frontmost
+  app is a game, like macOS Game Mode.
+- [Ping Warden](https://github.com/oliverames/ping-warden): AWDL control with latency graphs and a
+  Control Center toggle.
+- [geforcenow-awdl0](https://github.com/sjparkinson/geforcenow-awdl0): holds AWDL off while
+  GeForce NOW has a fullscreen window.
+
+AWDL Toggle differs in reacting to the game stream itself rather than to the client being open
+or in front, so AirDrop keeps working while you browse the GeForce NOW library.
+
+The AWDL Control README also suggests putting the access point's 5 GHz band on channel 44 (EU) or
+149 (US), the channels AWDL tends to use, so the radio has less reason to leave. That has not
+been tested here.
 
 ## License
 
