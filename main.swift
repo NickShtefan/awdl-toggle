@@ -7,53 +7,67 @@ let defaultLogDir = NSHomeDirectory() + "/Library/Application Support/NVIDIA/GeF
 
 // Test mode: AWDL and the client are simulated by files, the real interface is never touched.
 let testDir = ProcessInfo.processInfo.environment["AWDL_TEST_DIR"]
+let journalPath = testDir.map { $0 + "/events.log" } ?? NSHomeDirectory() + "/Library/Logs/AWDLToggle.log"
 
 // English by default, Russian when it is the first preferred language.
 let russian = Locale.preferredLanguages.first?.hasPrefix("ru") ?? false
 func tr(_ en: String, _ ru: String) -> String { russian ? ru : en }
 
 func note(_ message: String) {
-    let path = testDir.map { $0 + "/events.log" } ?? NSHomeDirectory() + "/Library/Logs/AWDLToggle.log"
+    // One older copy is kept, so a long fight with macOS cannot grow the journal without bound.
+    if let size = (try? FileManager.default.attributesOfItem(atPath: journalPath))?[.size] as? Int, size > 1_000_000 {
+        try? FileManager.default.removeItem(atPath: journalPath + ".1")
+        try? FileManager.default.moveItem(atPath: journalPath, toPath: journalPath + ".1")
+    }
     let line = Data("\(ISO8601DateFormatter().string(from: Date())) \(message)\n".utf8)
-    if let handle = FileHandle(forWritingAtPath: path) {
+    if let handle = FileHandle(forWritingAtPath: journalPath) {
         handle.seekToEndOfFile()
         handle.write(line)
         handle.closeFile()
     } else {
-        FileManager.default.createFile(atPath: path, contents: line)
+        FileManager.default.createFile(atPath: journalPath, contents: line)
     }
 }
 
-@discardableResult
-func run(_ path: String, _ args: [String]) -> (code: Int32, out: String) {
+func run(_ path: String, _ args: [String]) -> Int32 {
     let p = Process()
-    let pipe = Pipe()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
-    p.standardOutput = pipe
-    p.standardError = Pipe()
-    do { try p.run() } catch { return (-1, "") }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return -1 }
     p.waitUntilExit()
-    return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+    return p.terminationStatus
 }
 
+// Reads the flags in-process: no root and no process spawned per check.
 func awdlIsUp() -> Bool {
     if let dir = testDir {
         return (try? String(contentsOfFile: dir + "/awdl", encoding: .utf8))?.hasPrefix("up") ?? false
     }
-    return run(ifconfigPath, ["awdl0"]).out.split(separator: "\n").first?.contains("<UP") ?? false
+    var list: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&list) == 0 else { return false }
+    defer { freeifaddrs(list) }
+    var entry = list
+    while let ifa = entry {
+        if String(cString: ifa.pointee.ifa_name) == "awdl0" {
+            return ifa.pointee.ifa_flags & UInt32(IFF_UP) != 0
+        }
+        entry = ifa.pointee.ifa_next
+    }
+    return false
 }
 
 // Without a sudoers rule `sudo -n` fails and macOS shows its own password dialog.
 func setAwdl(up: Bool) -> Bool {
     let action = up ? "up" : "down"
     if let dir = testDir {
-        return (try? action.write(toFile: dir + "/awdl", atomically: true, encoding: .utf8)) != nil
+        // In place, so the watcher's file descriptor keeps pointing at the same file.
+        return (try? action.write(toFile: dir + "/awdl", atomically: false, encoding: .utf8)) != nil
     }
-    if run("/usr/bin/sudo", ["-n", ifconfigPath, "awdl0", action]).code == 0 { return true }
+    if run("/usr/bin/sudo", ["-n", ifconfigPath, "awdl0", action]) == 0 { return true }
     let script = "do shell script \"\(ifconfigPath) awdl0 \(action)\" with administrator privileges"
-    return run("/usr/bin/osascript", ["-e", script]).code == 0
+    return run("/usr/bin/osascript", ["-e", script]) == 0
 }
 
 func gfnIsRunning() -> Bool {
@@ -77,26 +91,84 @@ func logSaysStreaming() -> Bool {
     return false
 }
 
+// True for a routing message saying awdl0's flags changed. Only a hint: any local user can send
+// such a message, so the caller reads the real flags before acting on it.
+func isAwdlChange(_ bytes: UnsafeRawBufferPointer, awdlIndex: UInt32) -> Bool {
+    guard awdlIndex != 0, bytes.count >= MemoryLayout<if_msghdr>.size else { return false }
+    let msg = bytes.loadUnaligned(as: if_msghdr.self)
+    return Int32(msg.ifm_type) == RTM_IFINFO && UInt32(msg.ifm_index) == awdlIndex
+}
+
+// Reports the state of awdl0 whenever it may have changed: on messages from the kernel's routing
+// socket, which any user can read, or in test mode on writes to the simulated interface file.
+final class AwdlWatcher {
+    private var source: DispatchSourceProtocol?
+    var isActive: Bool { source != nil }
+
+    init(onChange: @escaping (Bool) -> Void) {
+        if let dir = testDir {
+            let fd = open(dir + "/awdl", O_EVTONLY)
+            guard fd >= 0 else { return }
+            let s = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
+            s.setEventHandler { onChange(awdlIsUp()) }
+            s.setCancelHandler { close(fd) }
+            s.resume()
+            source = s
+            return
+        }
+        let fd = socket(PF_ROUTE, SOCK_RAW, 0)
+        guard fd >= 0 else { return }
+        _ = fcntl(fd, F_SETFL, O_NONBLOCK)
+        let s = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        s.setEventHandler {
+            // Looked up on each wakeup, since the index can change if awdl0 is recreated.
+            let index = if_nametoindex("awdl0")
+            var buffer = [UInt8](repeating: 0, count: 2048)
+            var changed = false
+            // Drains the queue, so a burst of messages costs one check.
+            while true {
+                let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+                guard n > 0 else { break }
+                if buffer.withUnsafeBytes({ isAwdlChange(UnsafeRawBufferPointer(rebasing: $0[..<n]), awdlIndex: index) }) {
+                    changed = true
+                }
+            }
+            if changed { onChange(awdlIsUp()) }
+        }
+        s.setCancelHandler { close(fd) }
+        s.resume()
+        source = s
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     var busy = false
+    // A switch asked for while another one was running; the newest request wins.
+    var queued: Bool?
     var wasStreaming = false
-    // Set after a manual "on" or a cancelled dialog, cleared when the stream ends.
+    // Set after a manual "on" or a failed switch, cleared when a stream starts or ends.
     var keepOn = false
+    // Recent forced offs, to slow down when macOS keeps raising AWDL right back.
+    var recentOffs: [Date] = []
+    var slowed = false
+    var recheckScheduled = false
     var rendered: (up: Bool, streaming: Bool, auto: Bool)?
+    var watcher: AwdlWatcher?
 
     var autoEnabled: Bool {
         get { testDir != nil || UserDefaults.standard.bool(forKey: autoKey) }
         set { UserDefaults.standard.set(newValue, forKey: autoKey) }
     }
 
-    func applicationDidFinishLaunching(_ note: Notification) {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        watcher = AwdlWatcher { [weak self] up in self?.awdlChanged(up: up) }
+        if watcher?.isActive != true { note("interface watcher unavailable, relying on the 3 s check") }
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
         tick()
     }
 
     func tick() {
-        guard !busy else { return }
         // A crashed client never logs Streamer_Exit, so the stream also needs a live client.
         let streaming = autoEnabled && gfnIsRunning() && logSaysStreaming()
         let up = awdlIsUp()
@@ -106,7 +178,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             note("stream end")
             wasStreaming = false
             keepOn = false
-            if !up { apply(up: true) }
+            // A running switch may still turn it off, so the restore is queued behind it.
+            if !up || busy { apply(up: true) }
             return
         }
         if streaming && !wasStreaming {
@@ -114,23 +187,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keepOn = false
         }
         wasStreaming = streaming
-        // macOS can raise awdl0 on its own, so this keeps checking during the stream.
-        if streaming && up && !keepOn {
-            note("awdl is up during stream, turning off")
-            apply(up: false, auto: true)
-        }
+        // A backup for a missed event: macOS can raise awdl0 on its own during the stream.
+        holdDown(up: up, reason: "awdl is up during stream")
     }
 
-    func apply(up: Bool, auto: Bool = false) {
-        guard !busy else { return }
+    // macOS can raise awdl0 mid-stream at any moment; reacting to the event instead of waiting
+    // for the next tick keeps it from staying up for up to 3 seconds.
+    func awdlChanged(up: Bool) {
+        render(up: up, streaming: wasStreaming)
+        holdDown(up: up, reason: "awdl came up during stream")
+    }
+
+    // Turns AWDL off when it is up during a stream: at most every 0.5 s, and every 3 s after 10
+    // forced offs within 10 s, so a macOS that keeps raising it cannot pin the app in a loop of
+    // sudo calls.
+    func holdDown(up: Bool, reason: String) {
+        // A running switch checks the state again when it finishes.
+        guard wasStreaming && autoEnabled && up && !keepOn && !busy else { return }
+        let now = Date()
+        recentOffs.removeAll { now.timeIntervalSince($0) > 10 }
+        let gap: TimeInterval = recentOffs.count >= 10 ? 3 : 0.5
+        if gap > 1 && !slowed { note("awdl keeps coming back, turning it off at most every 3 s") }
+        slowed = gap > 1
+        if let last = recentOffs.last, now.timeIntervalSince(last) < gap {
+            guard !recheckScheduled else { return }
+            recheckScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + gap - now.timeIntervalSince(last)) {
+                self.recheckScheduled = false
+                self.holdDown(up: awdlIsUp(), reason: reason)
+            }
+            return
+        }
+        recentOffs.append(now)
+        note("\(reason), turning off")
+        apply(up: false)
+    }
+
+    func apply(up: Bool) {
+        if busy {
+            queued = up
+            return
+        }
         busy = true
         DispatchQueue.global().async {
             let ok = setAwdl(up: up)
             note("set \(up ? "up" : "down"): \(ok ? "ok" : "failed")")
             DispatchQueue.main.async {
                 self.busy = false
-                if auto && !ok { self.keepOn = true }
-                self.render(up: awdlIsUp(), streaming: self.wasStreaming)
+                // A failed or cancelled switch would otherwise be retried at once with another
+                // password dialog, so AWDL stays as it is until a stream starts or ends.
+                if !ok { self.keepOn = true }
+                if let next = self.queued {
+                    self.queued = nil
+                    if next != awdlIsUp() {
+                        self.apply(up: next)
+                        return
+                    }
+                }
+                self.awdlChanged(up: awdlIsUp())
             }
         }
     }
@@ -156,8 +270,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let toggle = menu.addItem(withTitle: up ? tr("Turn AWDL off", "Выключить AWDL")
                                                 : tr("Turn AWDL on", "Включить AWDL"),
-                                  action: #selector(toggleClicked), keyEquivalent: "")
+                                  action: #selector(toggleClicked(_:)), keyEquivalent: "")
         toggle.target = self
+        toggle.tag = up ? 0 : 1
         let autoItem = menu.addItem(withTitle: tr("Auto: off while playing GeForce NOW",
                                                   "Авто: выключать на время игры в GeForce NOW"),
                                     action: #selector(autoClicked), keyEquivalent: "")
@@ -169,11 +284,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu
     }
 
-    @objc func toggleClicked() {
-        let up = awdlIsUp()
-        note("manual toggle, awdl was \(up ? "up" : "down")")
-        keepOn = !up
-        apply(up: !up)
+    // The clicked title decides, not the state at click time, which may have changed since the
+    // menu was drawn; a click during another switch runs after it.
+    @objc func toggleClicked(_ sender: NSMenuItem) {
+        let turnOn = sender.tag == 1
+        note("manual toggle: turn \(turnOn ? "on" : "off")")
+        keepOn = turnOn
+        apply(up: turnOn)
     }
 
     @objc func autoClicked() {
@@ -190,6 +307,42 @@ if CommandLine.arguments.contains("--status") {
 if CommandLine.arguments.contains("--stream-state") {
     print(logSaysStreaming() ? "streaming" : "idle")
     exit(0)
+}
+if CommandLine.arguments.contains("--watch") {
+    let watcher = AwdlWatcher { up in print(up ? "up" : "down"); fflush(stdout) }
+    guard watcher.isActive else {
+        print("cannot watch awdl0")
+        exit(1)
+    }
+    print(awdlIsUp() ? "up" : "down")
+    fflush(stdout)
+    withExtendedLifetime(watcher) { dispatchMain() }
+}
+// Checks the routing-message filter on hand-made messages, which test.sh cannot produce.
+if CommandLine.arguments.contains("--self-test") {
+    func message(type: Int32, index: UInt16, length: Int = MemoryLayout<if_msghdr>.size) -> [UInt8] {
+        var msg = if_msghdr()
+        msg.ifm_msglen = UInt16(MemoryLayout<if_msghdr>.size)
+        msg.ifm_version = UInt8(RTM_VERSION)
+        msg.ifm_type = UInt8(type)
+        msg.ifm_index = index
+        msg.ifm_flags = IFF_UP
+        return Array(withUnsafeBytes(of: msg) { Array($0) }.prefix(length))
+    }
+    let cases: [(name: String, bytes: [UInt8], index: UInt32, expected: Bool)] = [
+        ("awdl0 change", message(type: RTM_IFINFO, index: 7), 7, true),
+        ("other interface", message(type: RTM_IFINFO, index: 8), 7, false),
+        ("other message type", message(type: RTM_NEWADDR, index: 7), 7, false),
+        ("truncated message", message(type: RTM_IFINFO, index: 7, length: 20), 7, false),
+        ("awdl0 missing, forged index 0", message(type: RTM_IFINFO, index: 0), 0, false),
+    ]
+    var failed = 0
+    for c in cases where c.bytes.withUnsafeBytes({ isAwdlChange($0, awdlIndex: c.index) }) != c.expected {
+        print("FAIL \(c.name)")
+        failed += 1
+    }
+    print(failed == 0 ? "ok" : "\(failed) failed")
+    exit(failed == 0 ? 0 : 1)
 }
 
 let app = NSApplication.shared
